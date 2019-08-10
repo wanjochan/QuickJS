@@ -41,6 +41,8 @@
 
 /* enable test262 thread support to test SharedArrayBuffer and Atomics */
 #define CONFIG_AGENT
+/* cross-realm tests (not supported yet) */
+//#define CONFIG_REALM
 
 #define CMD_NAME "run-test262"
 
@@ -432,7 +434,8 @@ typedef struct {
     char *str;
 } AgentReport;
 
-static void add_helpers(JSContext *ctx, int argc, char **argv);
+static JSValue add_helpers1(JSContext *ctx);
+static void add_helpers(JSContext *ctx);
 
 static pthread_mutex_t agent_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t agent_cond = PTHREAD_COND_INITIALIZER;
@@ -464,7 +467,7 @@ static void *agent_start(void *arg)
     JS_SetRuntimeInfo(rt, "agent");
     JS_SetCanBlock(rt, TRUE);
     
-    add_helpers(ctx, 0, NULL);
+    add_helpers(ctx);
     ret_val = JS_Eval(ctx, agent->script, strlen(agent->script),
                       "<evalScript>", JS_EVAL_TYPE_GLOBAL);
     free(agent->script);
@@ -641,13 +644,17 @@ static JSValue js_agent_sleep(JSContext *ctx, JSValue this_val,
     return JS_UNDEFINED;
 }
 
-static JSValue js_agent_monotonicNow(JSContext *ctx, JSValue this_val,
-                                     int argc, JSValue *argv)
+static int64_t get_clock_ms(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return JS_NewInt64(ctx, (uint64_t)ts.tv_sec * 1000 +
-                       (ts.tv_nsec / 1000000));
+    return (uint64_t)ts.tv_sec * 1000 + (ts.tv_nsec / 1000000);
+}
+
+static JSValue js_agent_monotonicNow(JSContext *ctx, JSValue this_val,
+                                     int argc, JSValue *argv)
+{
+    return JS_NewInt64(ctx, get_clock_ms());
 }
 
 static JSValue js_agent_getReport(JSContext *ctx, JSValue this_val,
@@ -717,7 +724,20 @@ static JSValue js_new_agent(JSContext *ctx)
 }
 #endif
 
-static void add_helpers(JSContext *ctx, int argc, char **argv)
+#ifdef CONFIG_REALM
+static JSValue js_createRealm(JSContext *ctx, JSValue this_val,
+                              int argc, JSValue *argv)
+{
+    JSContext *ctx1;
+    /* XXX: the context is not freed, need a refcount */
+    ctx1 = JS_NewContext(JS_GetRuntime(ctx));
+    if (!ctx1)
+        return JS_ThrowOutOfMemory(ctx);
+    return add_helpers1(ctx1);
+}
+#endif
+
+static JSValue add_helpers1(JSContext *ctx)
 {
     JSValue global_obj;
     JSValue obj262;
@@ -742,9 +762,24 @@ static void add_helpers(JSContext *ctx, int argc, char **argv)
     JS_SetPropertyStr(ctx, obj262, "agent", js_new_agent(ctx));
 #endif
 
-    JS_SetPropertyStr(ctx, global_obj, "$262", obj262);
+#ifdef CONFIG_REALM
+    JS_SetPropertyStr(ctx, obj262, "global",
+                      JS_DupValue(ctx, global_obj));
+
+    JS_SetPropertyStr(ctx, obj262, "createRealm",
+                      JS_NewCFunction(ctx, js_createRealm,
+                                      "createRealm", 0));
+#endif
+
+    JS_SetPropertyStr(ctx, global_obj, "$262", JS_DupValue(ctx, obj262));
     
     JS_FreeValue(ctx, global_obj);
+    return obj262;
+}
+
+static void add_helpers(JSContext *ctx)
+{
+    JS_FreeValue(ctx, add_helpers1(ctx));
 }
 
 static char *load_file(const char *filename, size_t *lenp)
@@ -1476,7 +1511,7 @@ int run_test_buf(const char *filename, char *harness, namelist_t *ip,
     /* loader for ES6 modules */
     JS_SetModuleLoaderFunc(rt, NULL, js_module_loader_test, NULL);
         
-    add_helpers(ctx, 0, NULL);
+    add_helpers(ctx);
 
     /* add backtrace if the isError property is present in a thrown
        object */
@@ -1535,7 +1570,7 @@ int run_test(const char *filename, int index)
     namelist_t include_list = { 0 }, *ip = &include_list;
     
     is_nostrict = is_onlystrict = is_negative = is_async = is_module = skip = FALSE;
-    can_block = FALSE;
+    can_block = TRUE;
     error_type = NULL;
     buf = load_file(filename, &buf_len);
 
@@ -1588,8 +1623,8 @@ int run_test(const char *filename, int index)
                         is_module = TRUE;
                         skip |= skip_module;
                     }
-                    else if (str_equal(option, "CanBlockIsTrue")) {
-                        can_block = TRUE;
+                    else if (str_equal(option, "CanBlockIsFalse")) {
+                        can_block = FALSE;
                     }
                     free(option);
                 }
@@ -1761,6 +1796,8 @@ void show_progress(int force) {
     }
 }
 
+static int slow_test_threshold;
+
 void run_test_dir_list(namelist_t *lp, int start_index, int stop_index)
 {
     int i;
@@ -1775,7 +1812,18 @@ void run_test_dir_list(namelist_t *lp, int start_index, int stop_index)
         } else if (stop_index >= 0 && test_index > stop_index) {
             test_skipped++;
         } else {
+            int ti;
+            if (slow_test_threshold != 0) {
+                ti = get_clock_ms();
+            } else {
+                ti = 0;
+            }
             run_test(p, test_index);
+            if (slow_test_threshold != 0) {
+                ti = get_clock_ms() - ti;
+                if (ti >= slow_test_threshold)
+                    fprintf(stderr, "\n%s (%d ms)\n", p, ti);
+            }
             show_progress(FALSE);
         }
         test_index++;
@@ -1793,6 +1841,7 @@ void help(void)
            "-s             run tests in strict mode, skip @nostrict tests\n"
            "-u             update error file\n"
            "-v             verbose: output error messages\n"
+           "-T duration    display tests taking more than 'duration' ms\n"
            "-c file        read configuration from 'file'\n"
            "-d dir         run all test files in directory tree 'dir'\n"
            "-e file        load the known errors from 'file'\n"
@@ -1859,6 +1908,8 @@ int main(int argc, char **argv)
             report_filename = get_opt_arg(arg, argv[optind++]);
         } else if (str_equal(arg, "-E")) {
             only_check_errors = TRUE;
+        } else if (str_equal(arg, "-T")) {
+            slow_test_threshold = atoi(get_opt_arg(arg, argv[optind++]));
         } else {
             fatal(1, "unknown option: %s", arg);
             break;
