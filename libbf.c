@@ -41,7 +41,6 @@
 #define USE_FFT_MUL
 
 //#define inline __attribute__((always_inline))
-#define unused __attribute__((unused))
 
 #ifdef __AVX2__
 #define FFT_MUL_THRESHOLD 100 /* in limbs of the smallest factor */
@@ -613,7 +612,7 @@ int bf_round(bf_t *r, limb_t prec, bf_flags_t flags)
 }
 
 /* for debugging */
-static unused void dump_limbs(const char *str, const limb_t *tab, limb_t n)
+static __maybe_unused void dump_limbs(const char *str, const limb_t *tab, limb_t n)
 {
     limb_t i;
     printf("%s: len=%" PRId_LIMB "\n", str, n);
@@ -1570,7 +1569,7 @@ int bf_remquo(slimb_t *pq, bf_t *r, const bf_t *a, const bf_t *b, limb_t prec,
     return ret;
 }
 
-static unused inline limb_t mul_mod(limb_t a, limb_t b, limb_t m)
+static __maybe_unused inline limb_t mul_mod(limb_t a, limb_t b, limb_t m)
 {
     dlimb_t t;
     t = (dlimb_t)a * (dlimb_t)b;
@@ -2475,6 +2474,7 @@ int bf_atof2(bf_t *r, slimb_t *pexponent,
 {
     const char *p, *p_start;
     int is_neg, radix_bits, exp_is_neg, ret, digits_per_limb, shift, sep;
+    int ret_legacy_octal = 0;
     limb_t cur_limb;
     slimb_t pos, expn, int_len, digit_count;
     BOOL has_decpt, is_bin_exp, is_float;
@@ -2525,6 +2525,7 @@ int bf_atof2(bf_t *r, slimb_t *pexponent,
         } else if ((p[1] >= '0' && p[1] <= '9') &&
                    radix == 0 && (flags & BF_ATOF_LEGACY_OCTAL)) {
             int i;
+            ret_legacy_octal = BF_ATOF_ST_LEGACY_OCTAL;
             /* the separator is not allowed in legacy octal literals */
             sep = 256;
             for (i = 1; (p[i] >= '0' && p[i] <= '7'); i++)
@@ -2745,7 +2746,7 @@ int bf_atof2(bf_t *r, slimb_t *pexponent,
  done:
     if (pnext)
         *pnext = p;
-    return ret;
+    return ret | ret_legacy_octal;
  error:
     if (!radix_bits)
         bf_delete(a);
